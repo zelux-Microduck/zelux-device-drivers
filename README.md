@@ -8,6 +8,24 @@
 - VL53L5CX ToF；
 - QMI8658、MPU6050、ICM42688 IMU；
 - Radxa PWM/Tach 风扇。
+- V4L2 / libcamera 摄像头。
+
+业务侧使用稳定型号 ID 创建驱动，不直接导入实现类：
+
+```python
+from zelux_drivers import create, descriptors
+
+print([item.to_dict() for item in descriptors("imu")])
+imu = create("zelux.imu.multi-i2c", ctx)
+```
+
+内置型号 ID：
+
+- `zelux.servo.feetech-sts-scs`
+- `zelux.tof.st-vl53l5cx`
+- `zelux.camera.v4l2-libcamera`
+- `zelux.fan.radxa-zero3w-dual-pwm`
+- `zelux.imu.multi-i2c`
 
 ```powershell
 python -m pip install -e .
