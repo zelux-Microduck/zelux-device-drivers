@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: {python-version: ["3.11", "3.13"]}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python-version }}"}
+      - run: python tools/check_version.py
+      - run: pip install -e . pytest build
+      - run: pytest -q
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with: {name: "drivers-${{ matrix.python-version }}", path: dist/}
