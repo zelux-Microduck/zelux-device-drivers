@@ -67,6 +67,23 @@ def yaw_step(yaw: float, gz: float, dt: float) -> float:
     return wrap180(yaw + gz * dt)
 
 
+def control_orientation(roll: float, pitch: float, yaw: float,
+                        gx: float, gy: float, gz: float) -> dict:
+    """Convert UI degrees into robotd's rad/s, gravity and wxyz contract."""
+    r, p, y = map(math.radians, (roll, pitch, yaw))
+    cr, sr = math.cos(r / 2.0), math.sin(r / 2.0)
+    cp, sp = math.cos(p / 2.0), math.sin(p / 2.0)
+    cy, sy = math.cos(y / 2.0), math.sin(y / 2.0)
+    quat = [cy * cp * cr + sy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr]
+    gravity = [math.sin(p), -math.sin(r) * math.cos(p),
+               -math.cos(r) * math.cos(p)]
+    return {"gyro_rad_s": [math.radians(gx), math.radians(gy), math.radians(gz)],
+            "gravity": gravity, "quaternion_wxyz": quat}
+
+
 def spread(values: list[float]) -> float:
     """峰峰值。向导用它判断"到底动不动"，比标准差更直观。"""
     return (max(values) - min(values)) if values else 0.0
@@ -294,7 +311,7 @@ class RadxaIMU:
         self._bias = {"gx": 0.0, "gy": 0.0, "gz": 0.0}
         self._cal = {"roll_offset": 0.0, "pitch_offset": 0.0, "roll_sign": 1, "pitch_sign": 1}
         self._state = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
-        self._gz = 0.0                      # 上一帧的偏航角速度（去偏后），页面画转向条用
+        self._gyro = [0.0, 0.0, 0.0]       # 去偏后的 °/s；对 robotd 发布时换成 rad/s
         self._hz = 0.0
         self._t_last = 0.0
         self._cache: dict = {"ok": False, "reason": "IMU 还没起来"}
@@ -375,7 +392,7 @@ class RadxaIMU:
         r, p = complementary(self._state["roll"], self._state["pitch"], acc_r, acc_p, gx, gy, dt)
         yaw = yaw_step(self._state["yaw"], gz, dt)
         self._state = {"roll": r, "pitch": p, "yaw": yaw}
-        self._gz = gz
+        self._gyro = [gx, gy, gz]
         self._t_last = time.time()
         self._frames.append({"t": self._t_last, "roll": round(r, 3), "pitch": round(p, 3),
                              "yaw": round(yaw, 3), "gz": round(gz, 3),
@@ -385,12 +402,16 @@ class RadxaIMU:
     def _build(self) -> dict:
         st = self._state
         cal = self._cal
+        roll = wrap180(st["roll"] * cal["roll_sign"] + cal["roll_offset"])
+        pitch = wrap180(st["pitch"] * cal["pitch_sign"] + cal["pitch_offset"])
+        control = control_orientation(roll, pitch, st["yaw"], *self._gyro)
         return {
             "ok": True,
-            "roll": round(wrap180(st["roll"] * cal["roll_sign"] + cal["roll_offset"]), 2),
-            "pitch": round(wrap180(st["pitch"] * cal["pitch_sign"] + cal["pitch_offset"]), 2),
+            "roll": round(roll, 2),
+            "pitch": round(pitch, 2),
             "yaw": round(st["yaw"], 2),
-            "gz": round(self._gz, 2),
+            "gz": round(self._gyro[2], 2),
+            **control,
             "chip": getattr(self._chip, "name", "?"),
             "calibrated": bool(self.ctx.state.get("imu_calibrated")),
             "yaw_drift": True,               # 没有磁力计，这是物理事实，页面要标"参考"
