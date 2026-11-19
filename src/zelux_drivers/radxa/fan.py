@@ -440,7 +440,9 @@ class RadxaFan:
 
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        await self._probe()
+        # _probe 是同步方法，不能 await；否则抛 "object NoneType can't be used in
+        # 'await' expression"，风扇这一块永远不可用
+        self._probe()
         if self._task is None or self._task.done():
             self._closing = False
             self._task = asyncio.create_task(self._rpm_loop(), name="fan-rpm")
@@ -554,6 +556,51 @@ class RadxaFan:
         return {"ok": all(a.get("ok") for a in applied) or not self.available,
                 "temp": temp, "pct": pct, "curve": [list(r) for r in self.curve],
                 "applied": applied, "available": self.available, "reason": self.reason}
+
+    # ---------------- 实例管理（fanctl 契约） ----------------
+    async def create_instance(self, instance: dict[str, Any]) -> dict:
+        """创建风扇实例：转发 {op:create, instance} 到 fanctl。"""
+        if not self.available:
+            return {"ok": False, "available": False, "reason": self.reason, "hint": self.hint}
+        try:
+            res = await self.helper.call({"op": "create", "instance": instance})
+            return {"ok": res.get("ok", True), "available": True, **res}
+        except FanUnavailable as exc:
+            self.log.warning("创建风扇实例失败：%s", exc.message)
+            return {"ok": False, "available": self.available, "reason": exc.message, "hint": exc.hint}
+
+    async def update_instance(self, instance_id: str, instance: dict[str, Any]) -> dict:
+        """更新风扇实例：转发 {op:update, instance_id, instance} 到 fanctl。"""
+        if not self.available:
+            return {"ok": False, "available": False, "reason": self.reason, "hint": self.hint}
+        try:
+            res = await self.helper.call({"op": "update", "instance_id": instance_id, "instance": instance})
+            return {"ok": res.get("ok", True), "available": True, **res}
+        except FanUnavailable as exc:
+            self.log.warning("更新风扇实例失败：%s", exc.message)
+            return {"ok": False, "available": self.available, "reason": exc.message, "hint": exc.hint}
+
+    async def delete_instance(self, instance_id: str) -> dict:
+        """删除风扇实例：转发 {op:delete, instance_id, confirm:true} 到 fanctl。"""
+        if not self.available:
+            return {"ok": False, "available": False, "reason": self.reason, "hint": self.hint}
+        try:
+            res = await self.helper.call({"op": "delete", "instance_id": instance_id, "confirm": True})
+            return {"ok": res.get("ok", True), "available": True, **res}
+        except FanUnavailable as exc:
+            self.log.warning("删除风扇实例失败：%s", exc.message)
+            return {"ok": False, "available": self.available, "reason": exc.message, "hint": exc.hint}
+
+    async def set_enabled(self, instance_id: str, enabled: bool) -> dict:
+        """启用/禁用风扇实例：转发 {op:enable/disable, instance_id} 到 fanctl。"""
+        if not self.available:
+            return {"ok": False, "available": False, "reason": self.reason, "hint": self.hint}
+        try:
+            res = await self.helper.call({"op": "enable" if enabled else "disable", "instance_id": instance_id})
+            return {"ok": res.get("ok", True), "available": True, **res}
+        except FanUnavailable as exc:
+            self.log.warning("设置风扇实例状态失败：%s", exc.message)
+            return {"ok": False, "available": self.available, "reason": exc.message, "hint": exc.hint}
 
     # ---------------- 读数 ----------------
     async def read(self, index: int) -> dict:
