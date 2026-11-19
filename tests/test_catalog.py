@@ -34,5 +34,5 @@ def test_factories_satisfy_complete_contracts():
     assert isinstance(create("zelux.servo.feetech-sts-scs", ctx), ServoDriver)
     assert isinstance(create("zelux.tof.st-vl53l5cx", ctx, bus=3, addr=0x52), TofDriver)
     assert isinstance(create("zelux.camera.v4l2-libcamera", ctx), CameraDriver)
-    assert isinstance(create("zelux.fan.radxa-zero3w-dual-pwm", ctx), FanDriver)
+    assert isinstance(create("zelux.fan.radxa-pwm", ctx), FanDriver)
     assert isinstance(create("zelux.imu.multi-i2c", ctx), ImuDriver)

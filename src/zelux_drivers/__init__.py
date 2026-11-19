@@ -17,8 +17,8 @@ register(DriverDescriptor("zelux.tof.st-vl53l5cx", DeviceKind.TOF, _VERSION,
 register(DriverDescriptor("zelux.camera.v4l2-libcamera", DeviceKind.CAMERA, _VERSION,
                           "Linux", ("UVC", "V4L2", "libcamera"),
                           ("snapshot", "stream")), RadxaCamera)
-register(DriverDescriptor("zelux.fan.radxa-zero3w-dual-pwm", DeviceKind.FAN, _VERSION,
-                          "Radxa", ("Zero 3W dual PWM fan",),
+register(DriverDescriptor("zelux.fan.radxa-pwm", DeviceKind.FAN, _VERSION,
+                          "Radxa", ("Zero 3W PWM fan instances",),
                           ("pwm", "tachometer", "temperature-curve")), RadxaFan)
 register(DriverDescriptor("zelux.imu.multi-i2c", DeviceKind.IMU, _VERSION,
                           "ZELUX", ("QMI8658", "MPU6050", "ICM42688"),

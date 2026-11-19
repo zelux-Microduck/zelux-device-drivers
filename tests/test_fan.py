@@ -1,10 +1,8 @@
 """测试风扇驱动实例管理方法的 socket payload。"""
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from zelux_drivers.radxa.fan import RadxaFan, FanHelper
+from zelux_drivers.contracts import FanDriver
 
 
 class FakeContext:
@@ -20,34 +18,30 @@ class FakeContext:
         self.log = logging.getLogger("test.fan")
 
 
-@pytest.fixture
-def mock_helper():
-    """创建一个 mock FanHelper。"""
+def create_fan_with_mock_helper():
+    """创建一个 RadxaFan 实例，注入 mock helper。"""
     helper = MagicMock(spec=FanHelper)
     helper.exists.return_value = True
     helper.call = AsyncMock(return_value={"ok": True})
-    return helper
 
-
-@pytest.fixture
-def fan(mock_helper):
-    """创建一个 RadxaFan 实例，注入 mock helper。"""
     ctx = FakeContext()
     fan = RadxaFan(ctx, fans=({"name": "测试风扇", "pwm": 14, "gpio": 116, "tach": None},))
-    fan.helper = mock_helper
+    fan.helper = helper
     fan.available = True
     fan.source = "helper"
-    return fan
+    return fan, helper
 
 
 class TestFanInstanceManagement:
     """测试风扇实例管理的 socket payload。"""
 
-    @pytest.mark.asyncio
-    async def test_create_instance_payload(self, fan, mock_helper):
+    def test_create_instance_payload(self):
         """create_instance 应该发送 {op:create, instance}。"""
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
         instance = {"name": "新风扇", "pwm": 14, "curve": [[50, 60]]}
-        result = await fan.create_instance(instance)
+
+        result = asyncio.run(fan.create_instance(instance))
 
         assert result["ok"] is True
         mock_helper.call.assert_called_once()
@@ -55,11 +49,13 @@ class TestFanInstanceManagement:
         assert payload["op"] == "create"
         assert payload["instance"] == instance
 
-    @pytest.mark.asyncio
-    async def test_update_instance_payload(self, fan, mock_helper):
+    def test_update_instance_payload(self):
         """update_instance 应该发送 {op:update, instance_id, instance}。"""
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
         instance = {"name": "更新风扇", "pwm": 14, "curve": [[55, 65]]}
-        result = await fan.update_instance("fan-1", instance)
+
+        result = asyncio.run(fan.update_instance("fan-1", instance))
 
         assert result["ok"] is True
         mock_helper.call.assert_called_once()
@@ -68,10 +64,12 @@ class TestFanInstanceManagement:
         assert payload["instance_id"] == "fan-1"
         assert payload["instance"] == instance
 
-    @pytest.mark.asyncio
-    async def test_delete_instance_payload(self, fan, mock_helper):
+    def test_delete_instance_payload(self):
         """delete_instance 应该发送 {op:delete, instance_id, confirm:true}。"""
-        result = await fan.delete_instance("fan-1")
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
+
+        result = asyncio.run(fan.delete_instance("fan-1"))
 
         assert result["ok"] is True
         mock_helper.call.assert_called_once()
@@ -80,10 +78,12 @@ class TestFanInstanceManagement:
         assert payload["instance_id"] == "fan-1"
         assert payload["confirm"] is True
 
-    @pytest.mark.asyncio
-    async def test_set_enabled_enable_payload(self, fan, mock_helper):
+    def test_set_enabled_enable_payload(self):
         """set_enabled(True) 应该发送 {op:enable, instance_id}。"""
-        result = await fan.set_enabled("fan-1", True)
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
+
+        result = asyncio.run(fan.set_enabled("fan-1", True))
 
         assert result["ok"] is True
         mock_helper.call.assert_called_once()
@@ -91,10 +91,12 @@ class TestFanInstanceManagement:
         assert payload["op"] == "enable"
         assert payload["instance_id"] == "fan-1"
 
-    @pytest.mark.asyncio
-    async def test_set_enabled_disable_payload(self, fan, mock_helper):
+    def test_set_enabled_disable_payload(self):
         """set_enabled(False) 应该发送 {op:disable, instance_id}。"""
-        result = await fan.set_enabled("fan-1", False)
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
+
+        result = asyncio.run(fan.set_enabled("fan-1", False))
 
         assert result["ok"] is True
         mock_helper.call.assert_called_once()
@@ -102,14 +104,15 @@ class TestFanInstanceManagement:
         assert payload["op"] == "disable"
         assert payload["instance_id"] == "fan-1"
 
-    @pytest.mark.asyncio
-    async def test_unavailable_returns_error(self, fan, mock_helper):
+    def test_unavailable_returns_error(self):
         """当 available=False 时应该返回错误而不是调用 helper。"""
+        import asyncio
+        fan, mock_helper = create_fan_with_mock_helper()
         fan.available = False
         fan.reason = "测试不可用"
         fan.hint = "测试提示"
 
-        result = await fan.create_instance({"name": "test"})
+        result = asyncio.run(fan.create_instance({"name": "test"}))
 
         assert result["ok"] is False
         assert result["available"] is False
@@ -120,9 +123,9 @@ class TestFanInstanceManagement:
 class TestFanDriverContract:
     """验证 RadxaFan 满足 FanDriver 协议。"""
 
-    def test_radxa_fan_satisfies_contract(self, fan):
+    def test_radxa_fan_satisfies_contract(self):
         """RadxaFan 应该实现 FanDriver 的所有方法。"""
-        from zelux_drivers.contracts import FanDriver
+        fan, _ = create_fan_with_mock_helper()
         assert isinstance(fan, FanDriver)
 
         # 检查所有方法都存在且是协程

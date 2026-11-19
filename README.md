@@ -24,7 +24,7 @@ imu = create("zelux.imu.multi-i2c", ctx)
 - `zelux.servo.feetech-sts-scs`
 - `zelux.tof.st-vl53l5cx`
 - `zelux.camera.v4l2-libcamera`
-- `zelux.fan.radxa-zero3w-dual-pwm`
+- `zelux.fan.radxa-pwm` (风扇数量由设备实例配置决定)
 - `zelux.imu.multi-i2c`
 
 ```powershell
