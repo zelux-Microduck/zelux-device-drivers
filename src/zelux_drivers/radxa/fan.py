@@ -205,6 +205,47 @@ class RadxaFan:
         self.error = ""
         return status
 
+    async def pwm_readiness(self) -> dict:
+        """Read-only kernel PWM inventory and board profile readiness."""
+        return await self.helper.call({"op": "pwm_readiness"})
+
+    async def pwm_setup(self, op: str, *, pin_id: str = "", token: str = "", confirm: bool = False) -> dict:
+        """Call the narrowly-scoped root overlay setup daemon, never a shell command."""
+        if op not in {"status", "preview", "apply", "rollback"}:
+            raise FanRequestError({"error": "不支持的 PWM setup 操作", "code": "denied"})
+        payload: dict[str, Any] = {"api_version": 1, "op": op}
+        if pin_id:
+            payload["pin_id"] = pin_id
+        if token:
+            payload["token"] = token
+        if op in {"apply", "rollback"}:
+            payload["confirm"] = bool(confirm)
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection("/run/zelux/pwm-setup.sock"), timeout=3.0)
+            writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+            await asyncio.wait_for(writer.drain(), 3.0)
+            line = await asyncio.wait_for(reader.readline(), 8.0)
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise FanUnavailable(f"PWM 配置服务不可用：{exc}", "检查 zelux-pwm-setupd.service") from None
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+        try:
+            response = json.loads(line.decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError):
+            raise FanUnavailable("PWM 配置服务返回无效响应") from None
+        if not isinstance(response, dict) or response.get("api_version") != 1:
+            raise FanUnavailable("PWM 配置服务契约版本不兼容")
+        if response.get("ok") is not True:
+            raise FanRequestError(response)
+        return response
+
     async def _command(self, payload: dict) -> dict:
         async with self._io_lock:
             result = await self.helper.call(payload)

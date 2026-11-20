@@ -1,6 +1,6 @@
 """ZELUX 可插拔设备驱动及内置型号目录。"""
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 from .catalog import create, descriptor, descriptors, register
 from .contracts import (CameraDriver, DeviceDriver, DeviceKind, DriverDescriptor,
