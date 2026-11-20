@@ -1,136 +1,122 @@
-"""测试风扇驱动实例管理方法的 socket payload。"""
-from unittest.mock import AsyncMock, MagicMock
-
-from zelux_drivers.radxa.fan import RadxaFan, FanHelper
+"""Service-only fan driver regression tests; no hardware is accessed."""
+import unittest
+import asyncio
+from unittest.mock import AsyncMock
+from zelux_drivers.radxa.fan import RadxaFan, FanRequestError, FanUnavailable, FanHelper, FanOutcomeUnknown
 from zelux_drivers.contracts import FanDriver
 
 
-class FakeContext:
-    class Config:
-        fan_socket = "/run/zelux/fan.sock"
-        fan_default_pct = 60
-        fan_curve = []
+class FanTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.fan = RadxaFan()
+        self.instance = {"id": "fan-mwnrt89v-1", "name": "Cooling", "enabled": True,
+                         "pwm": {"chip": 0, "channel": 0}, "period_ns": 40000,
+                         "driver_id": "zelux.fan.radxa-pwm", "tach_gpio": None,
+                         "pulses_per_rev": 2}
+        self.status = {"api_version": 1, "ok": True, "mode": "auto",
+                       "items": [{"id": self.instance["id"], "pct": 70}],
+                       "inventory": {"instances": [self.instance]}}
+        self.fan.helper.call = AsyncMock(return_value=self.status)
 
-    config = Config()
+    async def test_manual_uses_stable_instance_id(self):
+        await self.fan.refresh()
+        self.fan.helper.call.reset_mock()
+        self.fan.helper.call.return_value = {"ok": True, "pct": 45}
+        result = await self.fan.set_pct(self.instance["id"], 45)
+        self.assertTrue(result["ok"])
+        self.fan.helper.call.assert_awaited_once_with(
+            {"op": "set", "instance_id": self.instance["id"], "pct": 45})
 
-    def __init__(self):
-        import logging
-        self.log = logging.getLogger("test.fan")
+    async def test_legacy_index_resolves_from_inventory(self):
+        await self.fan.refresh()
+        await self.fan.set_pct(0, 50)
+        self.assertEqual(self.fan.helper.call.call_args.args[0]["instance_id"], self.instance["id"])
 
+    async def test_snapshot_preserves_inventory_and_live_items(self):
+        await self.fan.refresh()
+        snapshot = self.fan.snapshot_fan()
+        self.assertEqual(snapshot["inventory"]["instances"], [self.instance])
+        self.assertEqual(snapshot["items"], self.status["items"])
 
-def create_fan_with_mock_helper():
-    """创建一个 RadxaFan 实例，注入 mock helper。"""
-    helper = MagicMock(spec=FanHelper)
-    helper.exists.return_value = True
-    helper.call = AsyncMock(return_value={"ok": True})
+    async def test_fresh_driver_has_no_default_fans(self):
+        self.assertEqual(self.fan.fans, [])
+        self.assertEqual(self.fan.snapshot_fan()["items"], [])
+        self.assertIsInstance(self.fan, FanDriver)
 
-    ctx = FakeContext()
-    fan = RadxaFan(ctx, fans=({"name": "测试风扇", "pwm": 14, "gpio": 116, "tach": None},))
-    fan.helper = helper
-    fan.available = True
-    fan.source = "helper"
-    return fan, helper
+    async def test_create_refreshes_inventory(self):
+        await self.fan.create_instance(self.instance)
+        self.assertEqual(self.fan.helper.call.call_args_list[0].args[0],
+                         {"op": "create", "instance": self.instance})
+        self.assertEqual(self.fan.snapshot_fan()["inventory"]["instances"], [self.instance])
 
+    async def test_lifecycle_uses_service_only(self):
+        await self.fan.update_instance(self.instance["id"], self.instance)
+        await self.fan.set_enabled(self.instance["id"], False)
+        await self.fan.delete_instance(self.instance["id"])
+        payloads = [call.args[0] for call in self.fan.helper.call.call_args_list]
+        self.assertEqual([p["op"] for p in payloads],
+                         ["update", "status", "disable", "status", "delete", "status"])
+        self.assertTrue(payloads[-2]["confirm"])
 
-class TestFanInstanceManagement:
-    """测试风扇实例管理的 socket payload。"""
+    async def test_service_rejection_propagates(self):
+        self.fan.helper.call.side_effect = FanRequestError(
+            {"ok": False, "code": "resource_busy", "error": "occupied"})
+        with self.assertRaises(FanRequestError):
+            await self.fan.create_instance(self.instance)
 
-    def test_create_instance_payload(self):
-        """create_instance 应该发送 {op:create, instance}。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-        instance = {"name": "新风扇", "pwm": 14, "curve": [[50, 60]]}
+    async def test_committed_create_survives_refresh_failure(self):
+        self.fan.helper.call.side_effect = [
+            {"ok": True, "inventory": {"instances": [self.instance]}},
+            FanUnavailable("read timed out")]
+        result = await self.fan.create_instance(self.instance)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["status_stale"])
+        self.assertIn("refresh_warning", result)
+        self.assertEqual(self.fan.snapshot_fan()["inventory"]["instances"], [self.instance])
+        self.assertEqual(sum(c.args[0]["op"] == "create" for c in self.fan.helper.call.call_args_list), 1)
 
-        result = asyncio.run(fan.create_instance(instance))
+    async def test_committed_delete_does_not_resurrect_cached_instance(self):
+        await self.fan.refresh()
+        self.fan.helper.call.side_effect = [
+            {"ok": True, "inventory": {"instances": []}}, FanUnavailable("offline")]
+        result = await self.fan.delete_instance(self.instance["id"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.fan.snapshot_fan()["items"], [])
+        self.assertEqual(self.fan.snapshot_fan()["inventory"]["instances"], [])
 
-        assert result["ok"] is True
-        mock_helper.call.assert_called_once()
-        payload = mock_helper.call.call_args[0][0]
-        assert payload["op"] == "create"
-        assert payload["instance"] == instance
+    async def test_start_when_service_down_keeps_recovery_task(self):
+        self.fan.helper.call.side_effect = FanUnavailable("down")
+        await self.fan.start()
+        try:
+            self.assertFalse(self.fan.available)
+            self.assertFalse(self.fan._task.done())
+            self.fan.helper.call.side_effect = None
+            await self.fan.refresh()
+            self.assertTrue(self.fan.available)
+        finally:
+            await self.fan.stop()
+        self.assertIsNone(self.fan._task)
 
-    def test_update_instance_payload(self):
-        """update_instance 应该发送 {op:update, instance_id, instance}。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-        instance = {"name": "更新风扇", "pwm": 14, "curve": [[55, 65]]}
+    async def test_actual_helper_write_timeout_has_unknown_outcome(self):
+        from unittest.mock import patch, Mock
+        reader, writer = AsyncMock(), AsyncMock()
+        reader.readline.side_effect = asyncio.TimeoutError()
+        writer.write, writer.close = Mock(), Mock()
+        with patch("asyncio.open_unix_connection", AsyncMock(return_value=(reader, writer)), create=True):
+            with self.assertRaises(FanOutcomeUnknown):
+                await FanHelper("/fake").call({"op": "create", "instance": self.instance})
+        writer.write.assert_called_once()
 
-        result = asyncio.run(fan.update_instance("fan-1", instance))
-
-        assert result["ok"] is True
-        mock_helper.call.assert_called_once()
-        payload = mock_helper.call.call_args[0][0]
-        assert payload["op"] == "update"
-        assert payload["instance_id"] == "fan-1"
-        assert payload["instance"] == instance
-
-    def test_delete_instance_payload(self):
-        """delete_instance 应该发送 {op:delete, instance_id, confirm:true}。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-
-        result = asyncio.run(fan.delete_instance("fan-1"))
-
-        assert result["ok"] is True
-        mock_helper.call.assert_called_once()
-        payload = mock_helper.call.call_args[0][0]
-        assert payload["op"] == "delete"
-        assert payload["instance_id"] == "fan-1"
-        assert payload["confirm"] is True
-
-    def test_set_enabled_enable_payload(self):
-        """set_enabled(True) 应该发送 {op:enable, instance_id}。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-
-        result = asyncio.run(fan.set_enabled("fan-1", True))
-
-        assert result["ok"] is True
-        mock_helper.call.assert_called_once()
-        payload = mock_helper.call.call_args[0][0]
-        assert payload["op"] == "enable"
-        assert payload["instance_id"] == "fan-1"
-
-    def test_set_enabled_disable_payload(self):
-        """set_enabled(False) 应该发送 {op:disable, instance_id}。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-
-        result = asyncio.run(fan.set_enabled("fan-1", False))
-
-        assert result["ok"] is True
-        mock_helper.call.assert_called_once()
-        payload = mock_helper.call.call_args[0][0]
-        assert payload["op"] == "disable"
-        assert payload["instance_id"] == "fan-1"
-
-    def test_unavailable_returns_error(self):
-        """当 available=False 时应该返回错误而不是调用 helper。"""
-        import asyncio
-        fan, mock_helper = create_fan_with_mock_helper()
-        fan.available = False
-        fan.reason = "测试不可用"
-        fan.hint = "测试提示"
-
-        result = asyncio.run(fan.create_instance({"name": "test"}))
-
-        assert result["ok"] is False
-        assert result["available"] is False
-        assert "测试不可用" in result["reason"]
-        mock_helper.call.assert_not_called()
+    async def test_read_timeout_is_not_a_failed_write(self):
+        from unittest.mock import patch, Mock
+        reader, writer = AsyncMock(), AsyncMock()
+        reader.readline.side_effect = asyncio.TimeoutError()
+        writer.write, writer.close = Mock(), Mock()
+        with patch("asyncio.open_unix_connection", AsyncMock(return_value=(reader, writer)), create=True):
+            with self.assertRaises(FanUnavailable) as caught:
+                await FanHelper("/fake").call({"op": "status"})
+        self.assertNotIsInstance(caught.exception, FanOutcomeUnknown)
 
 
-class TestFanDriverContract:
-    """验证 RadxaFan 满足 FanDriver 协议。"""
-
-    def test_radxa_fan_satisfies_contract(self):
-        """RadxaFan 应该实现 FanDriver 的所有方法。"""
-        fan, _ = create_fan_with_mock_helper()
-        assert isinstance(fan, FanDriver)
-
-        # 检查所有方法都存在且是协程
-        import inspect
-        for method_name in ["create_instance", "update_instance", "delete_instance", "set_enabled"]:
-            method = getattr(fan, method_name)
-            assert callable(method)
-            assert inspect.iscoroutinefunction(method)
+if __name__ == "__main__":
+    unittest.main()
