@@ -1,0 +1,15 @@
+test_calibration_direction_and_offset_confirm_robotd_writes (test_servo_robotd_proxy.ServoRobotdProxyTests.test_calibration_direction_and_offset_confirm_robotd_writes) ... ok
+test_factory_take_snapshot_release_uses_socket_not_uart (test_servo_robotd_proxy.ServoRobotdProxyTests.test_factory_take_snapshot_release_uses_socket_not_uart) ... ok
+test_missing_robotd_never_falls_back_to_uart (test_servo_robotd_proxy.ServoRobotdProxyTests.test_missing_robotd_never_falls_back_to_uart) ... ok
+test_production_transport_refuses_direct_uart (test_servo_robotd_proxy.ServoRobotdProxyTests.test_production_transport_refuses_direct_uart) ... ok
+test_register_write_is_typed_robotd_command (test_servo_robotd_proxy.ServoRobotdProxyTests.test_register_write_is_typed_robotd_command) ... EEPROM 写入（20 号 寄存器 31=-2）：掉电保持，改前想清楚
+ok
+test_take_ends_unsupported_protocol_before_refusing (test_servo_robotd_proxy.ServoRobotdProxyTests.test_take_ends_unsupported_protocol_before_refusing) ... ok
+test_take_releases_lease_when_initial_snapshot_fails (test_servo_robotd_proxy.ServoRobotdProxyTests.test_take_releases_lease_when_initial_snapshot_fails) ... ok
+test_torque_and_synchronized_goals_are_proxied (test_servo_robotd_proxy.ServoRobotdProxyTests.test_torque_and_synchronized_goals_are_proxied) ... ok
+test_unconfirmed_ram_write_is_forwarded_as_unconfirmed (test_servo_robotd_proxy.ServoRobotdProxyTests.test_unconfirmed_ram_write_is_forwarded_as_unconfirmed) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.028s
+
+OK

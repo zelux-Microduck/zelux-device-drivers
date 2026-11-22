@@ -1,20 +1,8 @@
-"""Radxa Zero 3W 的舵机总线：15 颗 Feetech STS/SCS，`/dev/ttyS2` @ 1 Mbps，TTL 半双工。
+"""Servo adapter: robotd exclusively owns the physical bus.
 
-为什么不用 pyserial：
-镜像里是精简 Debian，装机现场经常没网，少一个 pip 依赖就少一类"装不上"；
-`termios` 是 libc 自带的老接口，1 Mbps 非标波特率也支持，这个协议够用。
-
-为什么拆三层（也为了能本机跑测试）：
-* `checksum()/frame()/sync_write_frame()` 纯函数 —— 不碰硬件就能验证帧格式；
-* `ServoProto` 只依赖 `send/recv` 两个方法，真串口和内存假总线都能插进来，
-  "发一帧、收一帧、超时重试、半双工回声"的脏活全在这里；
-* `RadxaServo` 是给 HAL 用的异步外壳：一把 `asyncio.Lock` + `to_thread`，
-  保证 1 Mbps 的总线 IO 不会堵住 10 Hz 的状态总线。
-
-半双工为什么要挑帧而不是"先 echo 后回包"：
-不同 TTL 转接板有的回显有的不回显，回显又可能和应答粘在一起（甚至断开在两段）。
-所以这里不做假设：把读到的字节喂进缓冲区，按 `FF FF id len err ... chk` 逐字节找，
-用"长度 + 校验和 + err==0"三重条件把回显和应答区分开。
+Production operations use the connection-bound robot.servoSession API v37.
+The local protocol helpers and FakeLink serve simulation and protocol tests only;
+there is no direct-UART fallback if robotd or its IPC is unavailable.
 """
 from __future__ import annotations
 
@@ -22,6 +10,8 @@ import asyncio
 import logging
 import math
 import os
+import json
+import socket
 import select
 import struct
 import time
@@ -474,10 +464,13 @@ class RadxaServo:
         self.port = getattr(cfg, "servo_port", "/dev/ttyS2")
         self.baud = int(getattr(cfg, "servo_baud", 1_000_000))
         self.sim = _env_flag("ZELUX_SERVO_SIM")
-        self.hold_path = os.environ.get("ZELUX_MOTIOND_HOLD", "/run/zelux/motiond.hold")
 
         self._lock = asyncio.Lock()
         self._proto: ServoProto | None = None
+        self._ipc_socket: socket.socket | None = None
+        self._ipc_reader = None
+        self._session_id: str | None = None
+        self._rpc_id = 0
         self._taken = False
         self._took_ms = 0
         self._missing: list[int] = []
@@ -486,51 +479,85 @@ class RadxaServo:
         self._cache: dict = {"online": 0, "items": [], "bus": "shared", "holding": 0,
                              "summary": {"online": 0, "holding": 0, "hot": 0}}
 
+    def _robotd_call_sync(self, params: dict) -> dict:
+        """Send one request on the persistent robotd connection that owns our lease."""
+        if self._ipc_socket is None:
+            path = os.environ.get("ZELUX_ROBOTD_SOCKET", "/run/robotd.sock")
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                sock.connect(path)
+                self._ipc_socket = sock
+                self._ipc_reader = sock.makefile("r", encoding="utf-8", newline="\n")
+            except OSError as exc:
+                raise hardware(f"robotd servo session unavailable: {exc}") from None
+        self._rpc_id += 1
+        request = {"jsonrpc": "2.0", "id": self._rpc_id,
+                   "method": "robot.servoSession", "params": params}
+        try:
+            self._ipc_socket.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            line = self._ipc_reader.readline()
+            if not line:
+                raise OSError("robotd closed the servo session connection")
+            response = json.loads(line)
+        except (OSError, ValueError, TypeError) as exc:
+            self._close_robotd_socket()
+            if self._taken:
+                self._taken = False
+                self._cache = {**self._cache, "bus": "shared"}
+            raise hardware(f"robotd servo session IPC failed; lease will expire after disconnect: {exc}") from None
+        if response.get("error"):
+            error = response["error"]
+            message = str(error.get("message", "robotd refused servo operation"))
+            code = error.get("code")
+            if (code == -32601 or "unknown method" in message.lower()
+                    or "method not found" in message.lower()
+                    or ("api version" in message.lower() and "unsupported" in message.lower())):
+                self._close_robotd_socket()
+                raise hardware("robotd update required: installed robotd does not support servo maintenance IPC")
+            raise hardware(message)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            self._close_robotd_socket()
+            raise hardware("robotd returned an invalid servo session response")
+        return result
+
+    def _close_robotd_socket(self) -> None:
+        reader, sock = self._ipc_reader, self._ipc_socket
+        self._ipc_reader, self._ipc_socket = None, None
+        self._session_id = None
+        if reader:
+            try:
+                reader.close()
+            except OSError:
+                pass
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _servo_command_sync(self, op: str, **fields) -> dict:
+        if not self._session_id:
+            raise hardware("servo maintenance session is not active")
+        return self._robotd_call_sync({"action": "command", "session_id": self._session_id,
+                                       "command": {"op": op, **fields}})
+
     # ---------------- 生命周期 ----------------
     async def start(self) -> None:
-        # 不主动开串口：motiond 可能正占着总线，只有用户点"接管"才抢。
+        # The physical bus belongs to robotd. Only simulation creates an in-memory transport.
         if self.sim:
             self.log.info("舵机总线用内存假总线（ZELUX_SERVO_SIM=1）")
 
     async def stop(self) -> None:
-        await self._stop_poll()
-        if self._proto:
-            # 关串口但不卸力：卸力鸭子会当场趴下，交还主程序才是正确的收尾。
+        if self._taken:
             try:
-                await asyncio.to_thread(self._proto.link.close)
-            except Exception:
-                pass
-            self._proto = None
-        self._taken = False
-        self._clear_hold()
-
-    def info(self) -> dict:
-        return {"backend": self.backend, "port": self.port, "baud": self.baud,
-                "sim": self.sim, "taken": self._taken, "speed_limit": self._speed_limit}
-
-    # ---------------- 接管 / 交还 ----------------
-    async def take(self) -> dict:
-        async with self._lock:
-            if self._taken:
-                return {"ok": True, "online": self._cache.get("online", 0),
-                        "missing": self._missing, "took_ms": self._took_ms, "again": True}
-            t0 = time.monotonic()
-            let_go = await asyncio.to_thread(self._signal_motiond)
-            if let_go:
-                # 给实时层 300 ms 收尾（它正跑 200 Hz 环，来不及放手会两边抢串口）
-                await asyncio.sleep(0.3)
-            res = await asyncio.to_thread(self._open_and_ping)
-            self._took_ms = int((time.monotonic() - t0) * 1000)
-            self._taken = True
-            self._missing = res["missing"]
-            self._start_poll()
-            self.log.info("已接管舵机总线：%d/%d 在线，用时 %d ms",
-                          res["online"], len(JOINT_IDS), self._took_ms)
-            return {"ok": True, "online": res["online"], "missing": res["missing"],
-                    "took_ms": self._took_ms}
-
-    async def release(self) -> dict:
-        async with self._lock:
+                await self.release()
+            except Exception as exc:
+                self.log.warning("停止时无法正常结束舵机维护会话：%s", exc)
+                self._close_robotd_socket()
+                self._taken = False
+        else:
             await self._stop_poll()
             if self._proto:
                 try:
@@ -538,33 +565,100 @@ class RadxaServo:
                 except Exception:
                     pass
                 self._proto = None
+
+    def info(self) -> dict:
+        return {"backend": self.backend, "port": self.port, "baud": self.baud,
+                "sim": self.sim, "taken": self._taken, "speed_limit": self._speed_limit}
+
+    # ---------------- 接管 / 交还 ----------------
+    async def take(self, supported: bool = False) -> dict:
+        async with self._lock:
+            if self._taken:
+                return {"ok": True, "online": self._cache.get("online", 0),
+                        "missing": self._missing, "took_ms": self._took_ms, "again": True}
+            t0 = time.monotonic()
+            if self.sim:
+                res = await asyncio.to_thread(self._open_and_ping)
+                self._taken = True
+                self._missing = res["missing"]
+                self._start_poll()
+                return {"ok": True, "online": res["online"], "missing": self._missing,
+                        "took_ms": int((time.monotonic() - t0) * 1000)}
+            result = await asyncio.to_thread(self._robotd_call_sync, {"action": "begin", "supported": supported})
+            self._session_id = result.get("session_id")
+            if not self._session_id:
+                self._close_robotd_socket()
+                raise hardware("robotd did not return a servo session token")
+            protocol = result.get("bus_protocol")
+            if protocol != "feetech-sts":
+                try:
+                    await asyncio.to_thread(
+                        self._robotd_call_sync,
+                        {"action": "end", "session_id": self._session_id},
+                    )
+                finally:
+                    self._close_robotd_socket()
+                if protocol is None:
+                    raise hardware("robotd update required: servo session does not report bus protocol")
+                raise hardware(f"Studio servo adapter does not support {protocol}; no register data was interpreted")
+            self._taken = True
+            self._took_ms = int((time.monotonic() - t0) * 1000)
+            lease_id = self._session_id
+            try:
+                snapshot = await asyncio.to_thread(self._read_all_sync)
+            except Exception:
+                # A failed initial bus read must not strand local "taken" state or the
+                # robotd lease. Explicit release is valid only on the original connection:
+                # after a transport failure the connection-bound lease can only expire by TTL.
+                try:
+                    if self._session_id == lease_id and lease_id is not None:
+                        await asyncio.to_thread(
+                            self._robotd_call_sync,
+                            {"action": "end", "session_id": lease_id},
+                        )
+                except Exception:
+                    pass
+                finally:
+                    self._close_robotd_socket()
+                    self._taken = False
+                    self._cache = {**self._cache, "bus": "shared"}
+                raise
+            self._missing = [sid for sid in JOINT_IDS if sid not in snapshot.get("ids", [])]
+            self._start_poll()
+            self.log.info("已通过 robotd 建立舵机维护会话：%d/%d 在线，用时 %d ms",
+                          snapshot.get("online", 0), len(JOINT_IDS), self._took_ms)
+            return {"ok": True, "online": snapshot.get("online", 0),
+                    "missing": self._missing, "took_ms": self._took_ms}
+
+    async def release(self) -> dict:
+        async with self._lock:
+            await self._stop_poll()
+            if self.sim:
+                if self._proto:
+                    try:
+                        await asyncio.to_thread(self._proto.link.close)
+                    except Exception:
+                        pass
+                    self._proto = None
+            elif self._session_id:
+                try:
+                    await asyncio.to_thread(self._robotd_call_sync,
+                                            {"action": "end", "session_id": self._session_id})
+                finally:
+                    self._close_robotd_socket()
             self._taken = False
-            await asyncio.to_thread(self._clear_hold)
             self._cache = {**self._cache, "bus": "shared"}
-            self.log.info("已交还舵机总线（舵机仍保持当前位置，不会卸力）")
-            return {"ok": True, "note": "舵机仍保持住，主程序可以接手"}
-
-    def _signal_motiond(self) -> bool:
-        """写 hold 文件让 motiond 让路；文件系统只读或目录没建都不算致命。"""
-        try:
-            os.makedirs(os.path.dirname(self.hold_path), exist_ok=True)
-            with open(self.hold_path, "w", encoding="utf-8") as fh:
-                fh.write(f"{time.time():.3f}\n")
-            return True
-        except OSError as exc:
-            self.log.warning("没写成 %s（%s），继续按'没有实时层'处理", self.hold_path, exc)
-            return False
-
-    def _clear_hold(self) -> None:
-        try:
-            os.unlink(self.hold_path)
-        except OSError:
-            pass
+            self.log.info("已交还舵机维护会话；舵机不卸力")
+            return {"ok": True, "note": "舵机仍保持住，robotd 恢复控制"}
 
     def _make_link(self):
-        return FakeLink() if self.sim else SerialLink(self.port, self.baud)
+        if not self.sim:
+            raise hardware("physical servo UART is owned exclusively by robotd")
+        return FakeLink()
 
     def _open_and_ping(self) -> dict:
+        if not self.sim:
+            raise hardware("direct physical servo access is disabled; use robotd servo session")
         try:
             link = self._make_link()
         except Exception as exc:
@@ -622,86 +716,141 @@ class RadxaServo:
 
     async def servo_read(self, sid: int) -> dict:
         async with self._lock:
-            proto = self._ensure()
-            rec = await asyncio.to_thread(proto.read_servo, int(sid), True)
-            if not rec:
-                raise hardware(f"{sid} 号舵机没应答，检查这根线或它的 ID")
+            if self.sim:
+                proto = self._ensure()
+                rec = await asyncio.to_thread(proto.read_servo, int(sid), True)
+                if not rec:
+                    raise hardware(f"{sid} 号舵机没应答，检查这根线或它的 ID")
+                return rec
+            self._need_robotd_session()
+            present = await asyncio.to_thread(self._servo_command_sync, "read_register",
+                                              servo_id=int(sid), address=56, length=8)
+            raw = bytes(present.get("data") or [])
+            if len(raw) != 8:
+                raise hardware(f"{sid} 号舵机反馈数据长度错误")
+            torque = await asyncio.to_thread(self._servo_command_sync, "read_register",
+                                             servo_id=int(sid), address=40, length=1)
+            offset = await asyncio.to_thread(self._servo_command_sync, "read_register",
+                                             servo_id=int(sid), address=31, length=2)
+            phase = await asyncio.to_thread(self._servo_command_sync, "read_register",
+                                            servo_id=int(sid), address=18, length=1)
+            off = bytes(offset.get("data") or [])
+            ph = bytes(phase.get("data") or [])
+            rec = {"id": int(sid), "pos": _le16(raw, 0),
+                   "speed": decode_speed(_le16(raw, 2)),
+                   "load": round(decode_load(_le16(raw, 4)), 1),
+                   "volt": round(raw[6] / 10.0, 1), "temp": raw[7],
+                   "torque": bool((torque.get("data") or [0])[0])}
+            if len(off) == 2:
+                signed = _le16(off, 0)
+                rec["offset"] = signed - 0x10000 if signed > 0x7FFF else signed
+            if ph:
+                rec["phase"] = ph[0]
+                rec["direction"] = -1 if ph[0] & 1 else 1
             return rec
 
-    async def servo_write(self, sid: int, reg: int, value: int, eeprom: bool = False) -> None:
+    def _need_robotd_session(self) -> None:
+        if not self._taken or not self._session_id:
+            raise hardware("还没接管舵机总线：先点「开始调舵机」")
+
+    async def servo_write(self, sid: int, reg: int, value: int, eeprom: bool = False,
+                          confirmed: bool = False) -> None:
         async with self._lock:
-            proto = self._ensure()
-            width = ADDR_WIDTH.get(int(reg), 1)
-            ok = await asyncio.to_thread(proto.write, int(sid), int(reg),
-                                         encode_reg(int(value), width))
-            if not ok:
-                raise hardware(f"{sid} 号舵机没确认写入（寄存器 {reg}），可能掉线或限位拒绝")
+            if self.sim:
+                proto = self._ensure()
+                width = ADDR_WIDTH.get(int(reg), 1)
+                ok = await asyncio.to_thread(proto.write, int(sid), int(reg),
+                                             encode_reg(int(value), width))
+                if not ok:
+                    raise hardware(f"{sid} 号舵机没确认写入（寄存器 {reg}）")
+            else:
+                self._need_robotd_session()
+                width = ADDR_WIDTH.get(int(reg), 1)
+                await asyncio.to_thread(self._servo_command_sync, "write_register",
+                                         servo_id=int(sid), address=int(reg),
+                                         data=list(encode_reg(int(value), width)), eeprom=bool(eeprom),
+                                         confirmed=bool(confirmed or eeprom or int(reg) in DANGER_TEXT))
             if eeprom:
                 self.log.warning("EEPROM 写入（%s 号 寄存器 %s=%s）：掉电保持，改前想清楚",
                                  sid, reg, value)
 
     async def servo_torque(self, on: bool, ids: list[int] | None = None) -> None:
         async with self._lock:
-            proto = self._ensure()
             targets = [int(i) for i in (ids or JOINT_IDS)]
-            items = [(i, bytes((1 if on else 0,))) for i in targets if i in JOINT_IDS]
-            if not items:
-                return
-            await asyncio.to_thread(proto.sync_write, REG["torque"][0], 1, items)
+            if self.sim:
+                proto = self._ensure()
+                items = [(i, bytes((1 if on else 0,))) for i in targets if i in JOINT_IDS]
+                if items:
+                    await asyncio.to_thread(proto.sync_write, REG["torque"][0], 1, items)
+            else:
+                self._need_robotd_session()
+                await asyncio.to_thread(self._servo_command_sync, "set_torque",
+                                         on=bool(on), servo_ids=targets)
 
-    # ---------------- 批量 ----------------
     async def write_goal_batch(self, goals: dict[int, int], speed: int | None = None) -> None:
-        """一帧 SYNC_WRITE 写满所有目标：位置 2 字节 + 速度 2 字节，从 41 开始 4 字节。"""
-        spd = self._speed_limit if speed is None else int(speed)
-        items = []
+        speed_value = self._speed_limit if speed is None else int(speed)
+        rows = []
         for sid, pos in goals.items():
             sid = int(sid)
             if sid not in JOINT_IDS:
                 continue
-            p = max(0, min(FULL_TURN - 1, int(pos)))
-            items.append((sid, struct.pack("<H", p) + encode_speed(spd)))
-        if not items:
+            rows.append((sid, max(0, min(FULL_TURN - 1, int(pos)))))
+        if not rows:
             return
         async with self._lock:
-            proto = self._ensure()
-            await asyncio.to_thread(proto.sync_write, REG["goal_pos"][0], 4, items)
+            if self.sim:
+                items = [(sid, struct.pack("<H", pos) + encode_speed(speed_value)) for sid, pos in rows]
+                await asyncio.to_thread(self._ensure().sync_write, REG["goal_pos"][0], 4, items)
+            else:
+                self._need_robotd_session()
+                encoded_speed = int.from_bytes(encode_speed(speed_value), "little")
+                goals_payload = [{"servo_id": sid, "position": pos, "speed": encoded_speed}
+                                 for sid, pos in rows]
+                await asyncio.to_thread(self._servo_command_sync, "sync_goals", goals=goals_payload)
 
     async def servo_sync_goal(self, goals: dict[int, int]) -> None:
         await self.write_goal_batch(goals)
 
-    # ---------------- 批量读 ----------------
     def _read_all_sync(self) -> dict:
-        proto = self._proto
-        if not proto:
-            return self._cache
-        items: list[dict] = []
-        for sid in JOINT_IDS:
-            rec = proto.read_servo(sid)
-            if rec:
-                items.append(rec)
-        # 只有接管成功才会走到这里，所以 bus 一定是 taken（take 里那一刻 _taken 还没置位）
+        if self.sim:
+            proto = self._proto
+            if not proto:
+                return self._cache
+            items = [rec for sid in JOINT_IDS if (rec := proto.read_servo(sid))]
+        else:
+            self._need_robotd_session()
+            result = self._servo_command_sync("snapshot")
+            try:
+                payload = json.loads(bytes(result.get("data") or []).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError, TypeError) as exc:
+                raise hardware(f"robotd returned an invalid servo snapshot: {exc}") from None
+            items = []
+            for row in payload.get("items", []):
+                raw = bytes(row.get("raw") or [])
+                if len(raw) < 8:
+                    continue
+                items.append({"id": int(row["id"]), "pos": _le16(raw, 0),
+                              "speed": decode_speed(_le16(raw, 2)),
+                              "load": round(decode_load(_le16(raw, 4)), 1),
+                              "volt": round(raw[6] / 10.0, 1), "temp": raw[7],
+                              "torque": bool(row.get("torque", False))})
         self._cache = self._compose(items, taken=True)
         return self._cache
 
     def _compose(self, items: list[dict], taken: bool = True) -> dict:
         temps = [i["temp"] for i in items]
-        return {
-            "online": len(items),
-            "ids": [i["id"] for i in items],
-            "items": items,
-            "bus": "taken" if taken else "shared",
-            "port": self.port,
-            "holding": sum(1 for i in items if i["torque"]),
-            "missing": list(self._missing),
-            "ts": time.time(),
-            "summary": {"online": len(items), "holding": sum(1 for i in items if i["torque"]),
-                        "hot": sum(1 for t in temps if t >= 60),
-                        "max_temp": max(temps) if temps else None},
-        }
+        return {"online": len(items), "ids": [i["id"] for i in items], "items": items,
+                "bus": "taken" if taken else "shared", "port": self.port,
+                "holding": sum(1 for i in items if i["torque"]), "missing": list(self._missing),
+                "ts": time.time(), "summary": {"online": len(items),
+                    "holding": sum(1 for i in items if i["torque"]),
+                    "hot": sum(1 for t in temps if t >= 60),
+                    "max_temp": max(temps) if temps else None}}
 
     async def read_all(self) -> dict:
         async with self._lock:
-            self._ensure()
+            if not self._taken:
+                raise hardware("还没接管舵机总线：先点「开始调舵机」")
             return await asyncio.to_thread(self._read_all_sync)
 
     def snapshot_servos(self) -> dict:
@@ -713,30 +862,48 @@ class RadxaServo:
         await self.servo_write(int(sid), REG["offset"][0], int(ticks), eeprom=True)
 
     async def set_direction(self, sid: int, sign: int) -> None:
-        """方向：只动相位寄存器 bit0，别把速度单位位（bit2/3）冲掉。"""
         async with self._lock:
-            proto = self._ensure()
-            raw = await asyncio.to_thread(proto.read, int(sid), REG["phase"][0], 1)
-            if not raw:
-                raise hardware(f"{sid} 号舵机读不到相位寄存器")
-            phase = raw[0] | 0x01 if int(sign) < 0 else raw[0] & ~0x01
-            ok = await asyncio.to_thread(proto.write, int(sid), REG["phase"][0], bytes((phase,)))
-            if not ok:
-                raise hardware(f"{sid} 号舵机方向没写进去（可能 0 位限位挡住）")
+            if self.sim:
+                proto = self._ensure()
+                raw = await asyncio.to_thread(proto.read, int(sid), REG["phase"][0], 1)
+                if not raw:
+                    raise hardware(f"{sid} 号舵机读不到相位寄存器")
+                phase = raw[0] | 1 if int(sign) < 0 else raw[0] & ~1
+                ok = await asyncio.to_thread(proto.write, int(sid), REG["phase"][0], bytes((phase,)))
+                if not ok:
+                    raise hardware(f"{sid} 号舵机方向没写进去")
+            else:
+                self._need_robotd_session()
+                result = await asyncio.to_thread(self._servo_command_sync, "read_register",
+                                                 servo_id=int(sid), address=18, length=1)
+                raw = result.get("data") or []
+                if not raw:
+                    raise hardware(f"{sid} 号舵机读不到相位寄存器")
+                phase = (int(raw[0]) | 1) if int(sign) < 0 else (int(raw[0]) & ~1)
+                await asyncio.to_thread(self._servo_command_sync, "write_register",
+                                         servo_id=int(sid), address=18, data=[phase], eeprom=True,
+                                         confirmed=True)
 
     async def save_offsets(self, items: Iterable) -> int:
-        """批量落 0 位：一帧 SYNC_WRITE 写完，比逐颗快一个数量级。"""
         rows = []
-        for it in items:
-            if isinstance(it, dict):
-                sid, ticks = int(it.get("id")), int(it.get("offset", 0))
+        for item in items:
+            if isinstance(item, dict):
+                sid, ticks = int(item.get("id")), int(item.get("offset", 0))
             else:
-                sid, ticks = int(it[0]), int(it[1])
+                sid, ticks = int(item[0]), int(item[1])
             if sid in JOINT_IDS:
-                rows.append((sid, encode_reg(ticks, 2)))
+                rows.append((sid, ticks))
         if not rows:
             return 0
         async with self._lock:
-            proto = self._ensure()
-            await asyncio.to_thread(proto.sync_write, REG["offset"][0], 2, rows)
+            if self.sim:
+                entries = [(sid, encode_reg(ticks, 2)) for sid, ticks in rows]
+                await asyncio.to_thread(self._ensure().sync_write, REG["offset"][0], 2, entries)
+            else:
+                self._need_robotd_session()
+                for sid, ticks in rows:
+                    await asyncio.to_thread(self._servo_command_sync, "write_register",
+                                             servo_id=sid, address=31,
+                                             data=list(encode_reg(ticks, 2)), eeprom=True,
+                                             confirmed=True)
         return len(rows)

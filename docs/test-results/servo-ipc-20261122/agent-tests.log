@@ -1,0 +1,118 @@
+.............................FE...........................servo driver zelux.servo.feetech-sts-scs metadata unavailable: catalog offline
+imu driver test.imu.custom metadata unavailable: catalog offline
+tof driver zelux.tof.st-vl53l5cx metadata unavailable: catalog offline
+fan driver zelux.fan.radxa-pwm metadata unavailable: catalog offline
+camera driver zelux.camera.v4l2-libcamera metadata unavailable: catalog offline
+..tof driver zelux.tof.custom metadata unavailable: '未知驱动：zelux.tof.custom'
+..tof driver zelux.tof.broken metadata unavailable: '未知驱动：zelux.tof.broken'
+ToF 的所选驱动起不来（selected driver failed），尝试默认驱动
+................................................EEPROM 写入（20 号 寄存器 18=1）：掉电保持，改前想清楚
+..EEPROM 写入（20 号 寄存器 31=-2）：掉电保持，改前想清楚
+......EEPROM 写入（20 号 寄存器 18=1）：掉电保持，改前想清楚
+..EEPROM 写入（20 号 寄存器 31=-2）：掉电保持，改前想清楚
+............................技能 boom 出错（0 ms）
+Traceback (most recent call last):
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/ai.py", line 1967, in _run_skill
+    out = await asyncio.wait_for(
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 520, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/ai.py", line 1989, in _call_handler
+    out = skill.handler(skill.ctx, text, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/tmplwq44_n7/skills/boom/handler.py", line 2, in run
+    raise RuntimeError("故意炸的")
+RuntimeError: 故意炸的
+.技能 boom 出错（0 ms）
+Traceback (most recent call last):
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/ai.py", line 1967, in _run_skill
+    out = await asyncio.wait_for(
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 520, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/ai.py", line 1989, in _call_handler
+    out = skill.handler(skill.ctx, text, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/tmptx0iiw2m/skills/boom/handler.py", line 2, in run
+    raise RuntimeError("故意炸的")
+RuntimeError: 故意炸的
+..技能 badjson 跳过：skill.json 不是合法 JSON：第 1 行 Expecting property name enclosed in double quotes
+技能 nohandler 跳过：缺 handler.py
+技能 wrongid 跳过：id（other）必须和目录名（wrongid）一致，否则卸载会删错东西
+.技能 badjson 跳过：skill.json 不是合法 JSON：第 1 行 Expecting property name enclosed in double quotes
+技能 nohandler 跳过：缺 handler.py
+技能 wrongid 跳过：id（other）必须和目录名（wrongid）一致，否则卸载会删错东西
+.技能 badjson 跳过：skill.json 不是合法 JSON：第 1 行 Expecting property name enclosed in double quotes
+技能 nohandler 跳过：缺 handler.py
+技能 wrongid 跳过：id（other）必须和目录名（wrongid）一致，否则卸载会删错东西
+....................
+======================================================================
+ERROR: test_production_driver_stable_id_and_lifecycle (test_fan_cross_layer.CrossLayerTests.test_production_driver_stable_id_and_lifecycle)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/tests/test_fan_cross_layer.py", line 63, in test_production_driver_stable_id_and_lifecycle
+    result = await module.cmd("op", {"op": "instance_create", "instance": self.instance})
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/fan.py", line 103, in cmd
+    return await self._cmd(op, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/fan.py", line 127, in _cmd
+    return await self._instance_create(args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/modules/fan.py", line 236, in _instance_create
+    raise ZeluxError("必须选择已验证就绪的物理 PWM 引脚", "denied")
+zeluxd.errors.ZeluxError: 必须选择已验证就绪的物理 PWM 引脚
+
+======================================================================
+FAIL: test_package_business_error_translated_by_agent (test_fan_cross_layer.CrossLayerTests.test_package_business_error_translated_by_agent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/qing/servo-driver-131.DhaGql/zelux-device-agent/software/zeluxd/tests/test_fan_cross_layer.py", line 83, in test_package_business_error_translated_by_agent
+    self.assertEqual(caught.exception.code, "resource_busy")
+AssertionError: 'denied' != 'resource_busy'
+- denied
++ resource_busy
+
+
+----------------------------------------------------------------------
+Ran 173 tests in 0.909s
+
+FAILED (failures=1, errors=1)
