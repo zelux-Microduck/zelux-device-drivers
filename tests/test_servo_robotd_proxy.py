@@ -25,12 +25,12 @@ class ServoRobotdProxyTests(unittest.IsolatedAsyncioTestCase):
         servo = self.make_servo()
         calls = []
         servo._robotd_call_sync = lambda params: calls.append(params) or {"data": [111]}
-        await servo.servo_write(20, 31, -2, eeprom=True)
+        await servo.servo_write(20, 31, -2, eeprom=True, confirmed=True)
         self.assertEqual(calls[0]["action"], "command")
         self.assertEqual(calls[0]["session_id"], "session-token")
         self.assertEqual(calls[0]["command"], {
             "op": "write_register", "servo_id": 20, "address": 31,
-            "data": [254, 255], "eeprom": True, "confirmed": True,
+"data": [2, 128], "eeprom": True, "confirmed": True,
         })
 
     async def test_unconfirmed_ram_write_is_forwarded_as_unconfirmed(self):

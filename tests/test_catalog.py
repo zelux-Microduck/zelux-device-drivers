@@ -36,3 +36,8 @@ def test_factories_satisfy_complete_contracts():
     assert isinstance(create("zelux.camera.v4l2-libcamera", ctx), CameraDriver)
     assert isinstance(create("zelux.fan.radxa-pwm", ctx), FanDriver)
     assert isinstance(create("zelux.imu.multi-i2c", ctx), ImuDriver)
+
+
+def test_hd1910_optional_maintenance_contract():
+    from zelux_drivers import ServoCenterDriver
+    assert isinstance(create("zelux.servo.feetech-sts-scs", Context()), ServoCenterDriver)

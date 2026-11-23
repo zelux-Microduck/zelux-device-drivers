@@ -1,4 +1,10 @@
-# 当前阶段：支撑确认与首次调试（1.4.0 / API v38）
+# 当前阶段：HD-1910滑块与中位校准（1.5.0 / API v39）
+
+独立工厂仍为生产入口，robotd独占物理总线。servo_goal复用维护会话sync_goals，center_backup/center_servos/restore_center_backup使用新增set_offset受限事务；校准前须固定支撑并显式卸力，失败保留备份，完成后不自动加力。偏移采用符号-幅值，位置42/时间44/速度46，方向来自主控逐关节配置。ServoCenterDriver为可选扩展，不要求第三方基础驱动伪装支持校准。
+
+配套要求：API39 robotd/robotctl、Agent1.7.0、Studio1.4.0。完整安全机制仍以zelux-robotd/docs/design/servo-studio-session.md为准。当前阶段未部署，须做单颗HD-1910硬件验收。以下为历史记录。
+
+## 历史：支撑确认与首次调试（1.4.0 / API v38）
 
 独立包与 Agent 内置驱动均支持 take(supported=False)，将明确支撑确认传递到 robotd，不直接打开 UART。Studio 确认后发送 true；没有确认不能绕过未归位/姿态门禁。运动、关机、总线反馈异常继续拒绝。必须配套升级 API v38 robotd/robotctl、Agent 和 Studio。
 

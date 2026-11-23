@@ -1,6 +1,6 @@
 """Servo adapter: robotd exclusively owns the physical bus.
 
-Production operations use the connection-bound robot.servoSession API v37.
+Production operations use the connection-bound robot.servoSession API v39.
 The local protocol helpers and FakeLink serve simulation and protocol tests only;
 there is no direct-UART fallback if robotd or its IPC is unavailable.
 """
@@ -23,12 +23,13 @@ from ..base import JOINT_IDS
 log = logging.getLogger("zeluxd.servo")
 
 # ---------------------------------------------------------------- 协议常量
-PING, READ, WRITE, REG_WRITE, ACTION, RESET, SYNC_WRITE = 1, 2, 3, 4, 5, 6, 0x83
+PING, READ, WRITE, REG_WRITE, ACTION = 1, 2, 3, 4, 5
+RESET, REBOOT, CALIBRATE, SYNC_READ, SYNC_WRITE = 6, 8, 0x0B, 0x82, 0x83
 BROADCAST = 0xFE
 CENTER = 2048
 FULL_TURN = 4096
 TICKS_PER_RAD = FULL_TURN / (2 * math.pi)      # 651.8986 步/弧度
-MAX_SPEED = 3400                               # STS3215 @ 1 Mbps 的上限，步/秒
+MAX_SPEED = 3400                               # HD-1910 速度上限，步/秒
 
 # 寄存器表：名字 → (起始地址, 字节数)。
 #
@@ -44,6 +45,10 @@ REG: dict[str, tuple[int, int]] = {
     "response": (8, 1),
     "min_angle": (9, 2),
     "max_angle": (11, 2),
+    "max_torque": (16, 2),
+    "min_start_torque": (24, 2),
+    "deadband_cw": (26, 1),
+    "deadband_ccw": (27, 1),
     "phase": (18, 1),        # bit0=方向反转，bit2/3=速度单位（日志里 18=52 → 1 步/秒）
     "protect": (19, 1),      # 卸载条件（堵转保护开关）
     "p": (21, 1),
@@ -52,8 +57,14 @@ REG: dict[str, tuple[int, int]] = {
     "offset": (31, 2),
     "mode": (33, 1),
     "torque": (40, 1),
-    "goal_pos": (41, 2),
-    "goal_speed": (43, 2),
+    "acceleration": (41, 1),
+    "goal_pos": (42, 2),
+    "goal_time": (44, 2),
+    "goal_speed": (46, 2),
+    "torque_limit": (48, 2),
+    "p_run": (50, 1),
+    "d_run": (51, 1),
+    "lock": (55, 1),
     "pos": (56, 2),
     "speed": (58, 2),
     "load": (60, 2),
@@ -95,12 +106,8 @@ def frame(sid: int, instr: int, params: bytes = b"") -> bytes:
 
 
 def sync_write_frame(addr: int, width: int, items: Iterable[tuple[int, bytes]]) -> bytes:
-    """STS 的 SYNC_WRITE：2 字节地址 + 2 字节长度（不是 SCS 的 1+1）。
-
-    一帧写满 15 颗：15 颗 × (1 字节 ID + width 字节数据)，总线只走一次，
-    这是 200 Hz 控制环能做起来的前提——逐颗写的话光串口就要 40 ms。
-    """
-    params = struct.pack("<HH", addr, width)
+    """飞特 STS/SCS SYNC_WRITE：地址和数据长度各 1 字节。"""
+    params = bytes((addr & 0xFF, width & 0xFF))
     n = 0
     for sid, data in items:
         if len(data) != width:
@@ -147,10 +154,39 @@ def _le16(buf: bytes, off: int = 0) -> int:
     return buf[off] | (buf[off + 1] << 8)
 
 
-def encode_reg(value: int, width: int) -> bytes:
-    """负值（0 位偏移、反向速度）按 16 位补码发。"""
+# HD-1910 profile: field readback on IDs 10/24 confirms bit15 sign.
+# Do not reuse this codec for other STS models without a verified profile.
+OFFSET_SIGN = 0x8000
+OFFSET_MAGNITUDE = 0x07FF
+
+
+def encode_signed_magnitude(value: int) -> bytes:
+    """HD-1910 register 31: bit15 sign, magnitude limited to 2047."""
+    value = int(value)
+    if abs(value) > OFFSET_MAGNITUDE:
+        raise ValueError("HD-1910 offset must be within -2047..2047")
+    return struct.pack("<H", abs(value) | (OFFSET_SIGN if value < 0 else 0))
+
+
+def decode_signed_magnitude(raw: int) -> int:
+    if raw < 0 or raw > 0xFFFF or raw & ~(OFFSET_SIGN | OFFSET_MAGNITUDE):
+        raise ValueError(f"invalid HD-1910 offset encoding; register 31 raw={raw:#06x} ({raw}); "
+                         "expected bit15 sign and magnitude <=2047; no offset write attempted")
+    return -(raw & OFFSET_MAGNITUDE) if raw & OFFSET_SIGN else raw
+
+def center_offset(offset: int, position: int, target: int = CENTER) -> int:
+    """present = (encoder - offset) mod 4096; preserve the physical pose."""
+    if abs(offset) > 2047 or not 0 <= position <= 4095 or target != CENTER:
+        raise ValueError("invalid STS center preview")
+    result = (offset + position - target + 2048) % 4096 - 2048
+    if result == -2048:
+        raise ValueError("center offset is at the unrepresentable half-turn boundary")
+    return result
+
+
+def encode_reg(value: int, width: int, *, signed_magnitude: bool = False) -> bytes:
     if width == 2:
-        return struct.pack("<H", value & 0xFFFF)
+        return encode_signed_magnitude(value) if signed_magnitude else struct.pack("<H", value & 0xFFFF)
     return bytes((value & 0xFF,))
 
 
@@ -246,8 +282,9 @@ class FakeLink:
     @staticmethod
     def _defaults(sid: int) -> dict[int, int]:
         return {5: sid, 6: 7, 8: 1, 9: 0, 11: 4095, 18: 52, 19: 52,
-                21: 16, 22: 32, 23: 8, 31: 0, 33: 0, 40: 0,
-                41: CENTER, 43: 0, 56: CENTER, 58: 0, 60: 0, 62: 78, 63: 32}
+                21: 16, 22: 32, 23: 8, 31: 0, 33: 0, 40: 0, 41: 0,
+                42: CENTER, 44: 0, 46: 0, 48: 1000, 50: 5, 51: 0, 55: 1,
+                56: CENTER, 58: 0, 60: 0, 62: 78, 63: 32}
 
     # -- 传输接口 --
     def send(self, data: bytes) -> None:
@@ -319,13 +356,29 @@ class FakeLink:
         elif instr == WRITE and len(p) >= 1 and sid in self.regs:
             self._poke(sid, p[0], p[1:])
             self._reply(sid, b"")
-        elif instr == SYNC_WRITE and len(p) >= 4:
-            addr, width = _le16(p, 0), _le16(p, 2)
-            body = p[4:]
+        elif instr == SYNC_READ and len(p) >= 3:
+            addr, width, targets = p[0], p[1], p[2:]
+            for target in targets:
+                if target in self.regs:
+                    mem = self._mem(target)
+                    self._reply(target, bytes(mem.get(addr + k, 0) for k in range(width)))
+        elif instr == SYNC_WRITE and len(p) >= 2:
+            addr, width = p[0], p[1]
+            body = p[2:]
             for k in range(0, len(body) - width, width + 1):
                 target = body[k]
                 if target in self.regs:
                     self._poke(target, addr, body[k + 1:k + 1 + width])
+        elif instr == CALIBRATE and sid in self.regs:
+            target = _le16(p, 0) if len(p) >= 2 else CENTER
+            current = self.regs[sid].get(REG["pos"][0], CENTER)
+            old_offset = decode_signed_magnitude(self.regs[sid].get(REG["offset"][0], 0))
+            new_offset = center_offset(old_offset, current, target)
+            self.regs[sid][REG["offset"][0]] = struct.unpack("<H", encode_signed_magnitude(new_offset))[0]
+            self.regs[sid][REG["pos"][0]] = target
+            self._reply(sid, b"")
+        elif instr == REBOOT and sid in self.regs:
+            self._reply(sid, b"")
         elif instr == RESET and sid in self.regs:
             self.regs[sid] = self._defaults(sid)
         # ACTION 无应答，符合协议
@@ -334,7 +387,7 @@ class FakeLink:
     def settle(self) -> None:
         """模拟"舵机走到目标位置"：让现值跟上目标，测姿势时可以看最终落点。"""
         for sid, regs in self.regs.items():
-            regs[56] = regs.get(41, CENTER)
+            regs[56] = regs.get(42, CENTER)
 
 
 # ---------------------------------------------------------------- 协议客户端
@@ -414,8 +467,77 @@ class ServoProto:
         return self.transact(sid, WRITE, bytes((addr,)) + bytes(data), 0) is not None
 
     def sync_write(self, addr: int, width: int, items: list[tuple[int, bytes]]) -> None:
-        """广播写没有应答，发出去就算成功（真丢包靠下一帧目标位置兜住）。"""
+        """广播写没有应答，发出去就算成功（真丢包靠回读校验）。"""
         self.link.send(sync_write_frame(addr, width, items))
+
+    def _scan_any(self, allowed: set[int], n_params: int) -> tuple[int, bytes] | None:
+        """从缓冲区取任意一颗允许 ID 的状态包，过滤 TTL 回显。"""
+        buf, i, need = self._buf, 0, n_params + 2
+        while i + 4 <= len(buf):
+            if buf[i] != 0xFF or buf[i + 1] != 0xFF:
+                i += 1
+                continue
+            sid = buf[i + 2]
+            if sid not in allowed or buf[i + 3] != need:
+                i += 1
+                continue
+            total = 4 + need
+            if len(buf) < i + total:
+                return None
+            body = bytes(buf[i + 2:i + total - 1])
+            if checksum(body) != buf[i + total - 1] or body[2] != 0:
+                i += 1
+                continue
+            del buf[:i + total]
+            return sid, bytes(body[3:])
+        del buf[:i]
+        return None
+
+    def sync_read(self, ids: list[int], addr: int, n: int) -> dict[int, bytes | None]:
+        """飞特 SYNC_READ：一次请求，收齐多颗状态包；缺包记 None。"""
+        ids = [int(sid) for sid in ids]
+        out: dict[int, bytes | None] = dict.fromkeys(ids)
+        if not ids:
+            return out
+        self._buf.clear()
+        self.link.send(frame(BROADCAST, SYNC_READ, bytes((addr & 0xFF, n & 0xFF, *ids))))
+        waiting = set(ids)
+        # 50 Hz 刷新必须在一个 20 ms 周期内结束；缺一颗不能把整帧拖到数百毫秒。
+        deadline = time.monotonic() + max(0.01, self.timeout * 0.9)
+        while waiting and time.monotonic() < deadline:
+            got = self._scan_any(waiting, n)
+            if got is not None:
+                sid, data = got
+                out[sid] = data
+                waiting.discard(sid)
+                continue
+            chunk = self.link.recv(min(0.004, max(0.0, deadline - time.monotonic())))
+            if chunk:
+                self._buf += chunk
+            else:
+                time.sleep(0.0005)
+        return out
+
+    def read_states_fast(self, ids: list[int]) -> dict[int, dict | None]:
+        raw = self.sync_read(ids, PRESENT_ADDR, PRESENT_N)
+        out: dict[int, dict | None] = {}
+        for sid, block in raw.items():
+            if not block:
+                out[sid] = None
+                continue
+            out[sid] = {
+                "id": sid,
+                "pos": _le16(block, 0),
+                "speed": decode_speed(_le16(block, 2)),
+                "load": round(decode_load(_le16(block, 4)), 1),
+                "volt": round(block[6] / 10.0, 1),
+                "temp": block[7],
+            }
+        return out
+
+    def calibrate_to(self, sid: int, target: int = CENTER) -> bool:
+        """把舵机当前物理位置校准为 target；HD-1910 使用 0x0B 指令。"""
+        return self.transact(sid, CALIBRATE, struct.pack("<H", target & 0xFFFF), 0) is not None
 
     def read_servo(self, sid: int, full: bool = False) -> dict | None:
         block = self.read(sid, PRESENT_ADDR, PRESENT_N)
@@ -432,15 +554,20 @@ class ServoProto:
             "torque": bool(torque[0]) if torque else False,
         }
         if full:
-            # 页面上的单颗详情要看到 0 位与方向，轮询时就不读这两项，省总线
+            # 页面单颗详情：EEPROM 偏移/相位，以及运行中的限力/P/D。
             off = self.read(sid, REG["offset"][0], 2)
             phase = self.read(sid, REG["phase"][0], 1)
+            gains = self.read(sid, REG["torque_limit"][0], 4)
             if off:
                 raw = _le16(off, 0)
-                rec["offset"] = raw - 0x10000 if raw > 0x7FFF else raw
+                rec["offset"] = decode_signed_magnitude(raw)
             if phase:
                 rec["phase"] = phase[0]
-                rec["direction"] = -1 if phase[0] & 0x01 else 1
+                rec["phase_direction"] = -1 if phase[0] & 0x01 else 1
+                rec["direction"] = -1  # 软件模型方向；不是相位寄存器 bit0
+            if gains and len(gains) == 4:
+                rec["torque_limit"] = _le16(gains, 0)
+                rec["p_run"], rec["d_run"] = gains[2], gains[3]
         return rec
 
 
@@ -743,7 +870,10 @@ class RadxaServo:
                    "torque": bool((torque.get("data") or [0])[0])}
             if len(off) == 2:
                 signed = _le16(off, 0)
-                rec["offset"] = signed - 0x10000 if signed > 0x7FFF else signed
+                try:
+                    rec["offset"] = decode_signed_magnitude(signed)
+                except ValueError as exc:
+                    raise hardware(f"{sid} 号舵机偏移编码异常：{exc}；保留备份，禁止猜测转换") from exc
             if ph:
                 rec["phase"] = ph[0]
                 rec["direction"] = -1 if ph[0] & 1 else 1
@@ -755,12 +885,14 @@ class RadxaServo:
 
     async def servo_write(self, sid: int, reg: int, value: int, eeprom: bool = False,
                           confirmed: bool = False) -> None:
+        if int(sid) not in JOINT_IDS or (int(reg) == 31 and abs(int(value)) > 2047):
+            raise hardware("invalid servo ID or HD-1910 offset")
         async with self._lock:
             if self.sim:
                 proto = self._ensure()
                 width = ADDR_WIDTH.get(int(reg), 1)
                 ok = await asyncio.to_thread(proto.write, int(sid), int(reg),
-                                             encode_reg(int(value), width))
+                                             (encode_signed_magnitude(int(value)) if int(reg) == 31 else encode_reg(int(value), width)))
                 if not ok:
                     raise hardware(f"{sid} 号舵机没确认写入（寄存器 {reg}）")
             else:
@@ -768,8 +900,8 @@ class RadxaServo:
                 width = ADDR_WIDTH.get(int(reg), 1)
                 await asyncio.to_thread(self._servo_command_sync, "write_register",
                                          servo_id=int(sid), address=int(reg),
-                                         data=list(encode_reg(int(value), width)), eeprom=bool(eeprom),
-                                         confirmed=bool(confirmed or eeprom or int(reg) in DANGER_TEXT))
+                                         data=list(encode_signed_magnitude(int(value)) if int(reg) == 31 else encode_reg(int(value), width)), eeprom=bool(eeprom),
+                                         confirmed=bool(confirmed))
             if eeprom:
                 self.log.warning("EEPROM 写入（%s 号 寄存器 %s=%s）：掉电保持，改前想清楚",
                                  sid, reg, value)
@@ -799,8 +931,8 @@ class RadxaServo:
             return
         async with self._lock:
             if self.sim:
-                items = [(sid, struct.pack("<H", pos) + encode_speed(speed_value)) for sid, pos in rows]
-                await asyncio.to_thread(self._ensure().sync_write, REG["goal_pos"][0], 4, items)
+                items = [(sid, struct.pack("<HH", pos, 0) + encode_speed(speed_value)) for sid, pos in rows]
+                await asyncio.to_thread(self._ensure().sync_write, REG["goal_pos"][0], 6, items)
             else:
                 self._need_robotd_session()
                 encoded_speed = int.from_bytes(encode_speed(speed_value), "little")
@@ -833,13 +965,14 @@ class RadxaServo:
                               "speed": decode_speed(_le16(raw, 2)),
                               "load": round(decode_load(_le16(raw, 4)), 1),
                               "volt": round(raw[6] / 10.0, 1), "temp": raw[7],
+                              "model_direction": row.get("model_direction"),
                               "torque": bool(row.get("torque", False))})
         self._cache = self._compose(items, taken=True)
         return self._cache
 
     def _compose(self, items: list[dict], taken: bool = True) -> dict:
         temps = [i["temp"] for i in items]
-        return {"online": len(items), "ids": [i["id"] for i in items], "items": items,
+        return {"source": "sim" if self.sim else "robotd", "online": len(items), "ids": [i["id"] for i in items], "items": items,
                 "bus": "taken" if taken else "shared", "port": self.port,
                 "holding": sum(1 for i in items if i["torque"]), "missing": list(self._missing),
                 "ts": time.time(), "summary": {"online": len(items),
@@ -857,9 +990,113 @@ class RadxaServo:
         return self._cache
 
     # ---------------- 标定辅助 ----------------
+    async def servo_goal(self, sid: int, pos: int) -> dict:
+        if int(sid) not in JOINT_IDS or not 0 <= int(pos) < FULL_TURN:
+            raise hardware("invalid servo goal")
+        await self.write_goal_batch({int(sid): int(pos)}, speed=200)
+        return {"id": int(sid), "pos": int(pos)}
+
+    async def center_backup(self, ids: list[int]) -> dict:
+        backup = {}
+        for sid in ids:
+            rec = await self.servo_read(int(sid))
+            if rec.get("torque"):
+                raise hardware(f"{sid} 号仍在加力：先固定支撑机体并显式卸力，再进行中位校准")
+            backup[int(sid)] = {"pos": rec["pos"], "offset": rec["offset"], "torque": False}
+        return backup
+
+    async def _offset_compare_set(self, sid: int, expected: int, offset: int,
+                                  position: int | None = None) -> dict:
+        if abs(expected) > 2047 or abs(offset) > 2047:
+            raise hardware("HD-1910 offset must be within -2047..2047")
+        async with self._lock:
+            if self.sim:
+                proto = self._ensure()
+                rec = await asyncio.to_thread(proto.read_servo, sid, True)
+                if not rec or rec["torque"] or rec["offset"] != expected:
+                    raise hardware("center backup is stale or torque is on")
+                if position is not None:
+                    if abs(rec["pos"] - position) > 2:
+                        raise hardware("center preview is stale")
+                    ok = await asyncio.to_thread(proto.calibrate_to, sid, CENTER)
+                else:
+                    ok = await asyncio.to_thread(proto.write, sid, 31, encode_signed_magnitude(offset))
+                if not ok:
+                    raise hardware("offset write failed")
+                return {"offset_before": expected, "offset_after": offset}
+            self._need_robotd_session()
+            response = await asyncio.to_thread(self._servo_command_sync, "set_offset",
+                servo_id=sid, expected_offset=expected, offset=offset,
+                expected_position=position, confirmed=True)
+            return json.loads(bytes(response.get("data") or []).decode("utf-8"))
+
+    async def center_servos(self, ids: list[int], target: int = CENTER, backup: dict | None = None) -> dict:
+        if target != CENTER:
+            raise hardware("only HD-1910 center 2048 is supported")
+        rows = {int(k): v for k, v in (backup or {}).items()}
+        # Validate the entire batch before the first EEPROM write.
+        planned = {int(sid): center_offset(int(rows[int(sid)]["offset"]), int(rows[int(sid)]["pos"]), target)
+                   for sid in ids}
+        results = {}
+        try:
+            for sid in ids:
+                row = rows[int(sid)]
+                new = planned[int(sid)]
+                results[int(sid)] = await self._offset_compare_set(int(sid), int(row["offset"]), new, int(row["pos"]))
+        except Exception as error:
+            failures = []
+            for sid, result in reversed(list(results.items())):
+                try:
+                    await self._offset_compare_set(sid, result["offset_after"], int(rows[sid]["offset"]))
+                except Exception as rollback:
+                    failures.append(f"{sid}: {rollback}")
+            raise hardware(f"中位校准未完成：{error}；已完成项回滚：{failures or '成功'}；保留备份，请检查后恢复") from error
+        return {"results": results}
+
+
+    async def restore_center_backup(self, backup: dict) -> dict:
+        restored = []
+        planned = []
+        if not isinstance(backup, dict) or not backup:
+            raise hardware("中位备份为空或格式错误：保留文件，不执行恢复")
+        targets = {}
+        for key, row in backup.items():
+            # Accept canonical JSON keys and in-process integer IDs only.
+            # Never truncate floats, accept booleans or silently merge aliases.
+            if type(key) is int:
+                sid = key
+            elif type(key) is str and key.isascii() and key.isdecimal():
+                sid = int(key)
+                if str(sid) != key:
+                    raise hardware(f"中位备份 ID 格式错误：{key!r}；保留备份")
+            else:
+                raise hardware(f"中位备份 ID 格式错误：{key!r}；保留备份")
+            target = row.get("offset") if isinstance(row, dict) else None
+            if sid not in JOINT_IDS or type(target) is not int or abs(target) > 2047:
+                raise hardware(f"{sid} 号备份 ID 或偏移无效（offset={target!r}）：保留备份，不执行恢复")
+            if sid in targets:
+                raise hardware(f"中位备份包含重复舵机 {sid}：保留备份，不执行恢复")
+            targets[sid] = target
+        for sid, target in targets.items():
+            current = await self.servo_read(sid)
+            if current["torque"]:
+                raise hardware(f"{sid} 号仍在加力：恢复偏移前请固定支撑并卸力")
+            planned.append((sid, int(current["offset"]), target))
+        # Preflight every entry before writing any. robotd still checks the
+        # expected offset, torque and movement again at each actual write.
+        for sid, expected, target in planned:
+            if expected != target:
+                try:
+                    await self._offset_compare_set(sid, expected, target)
+                except Exception as exc:
+                    raise hardware(f"恢复中位在 {sid} 号失败：{exc}；已恢复 {restored}；"
+                                   "备份保留，未自动加力，请检查后重试恢复") from exc
+            restored.append(sid)
+        return {"restored": restored}
+
     async def set_offset(self, sid: int, ticks: int) -> None:
-        """0 位偏移：写 EEPROM 里的 offset，负值按 16 位补码。"""
-        await self.servo_write(int(sid), REG["offset"][0], int(ticks), eeprom=True)
+        """0 位偏移：写 EEPROM 里的 offset，负值按符号-幅值编码。"""
+        await self.servo_write(int(sid), REG["offset"][0], int(ticks), eeprom=True, confirmed=True)
 
     async def set_direction(self, sid: int, sign: int) -> None:
         async with self._lock:
@@ -897,7 +1134,7 @@ class RadxaServo:
             return 0
         async with self._lock:
             if self.sim:
-                entries = [(sid, encode_reg(ticks, 2)) for sid, ticks in rows]
+                entries = [(sid, encode_signed_magnitude(ticks)) for sid, ticks in rows]
                 await asyncio.to_thread(self._ensure().sync_write, REG["offset"][0], 2, entries)
             else:
                 self._need_robotd_session()

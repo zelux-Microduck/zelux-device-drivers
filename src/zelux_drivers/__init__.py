@@ -1,16 +1,16 @@
 """ZELUX 可插拔设备驱动及内置型号目录。"""
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 from .catalog import create, descriptor, descriptors, register
 from .contracts import (CameraDriver, DeviceDriver, DeviceKind, DriverDescriptor,
-                        FanDriver, ImuDriver, ServoDriver, TofDriver)
+                        FanDriver, ImuDriver, ServoDriver, ServoCenterDriver, TofDriver)
 from .radxa import RadxaCamera, RadxaFan, RadxaIMU, RadxaServo, RadxaTof
 
 _VERSION = __version__
 register(DriverDescriptor("zelux.servo.feetech-sts-scs", DeviceKind.SERVO, _VERSION,
-                          "Feetech", ("STS3215", "STS", "SCS"),
-                          ("read", "write", "sync-goal", "torque", "calibration")), RadxaServo)
+                          "Feetech", ("HD-1910", "STS3215", "STS", "SCS"),
+                          ("read", "write", "sync-goal", "torque", "calibration", "single-goal", "center-backup", "center-restore")), RadxaServo)
 register(DriverDescriptor("zelux.tof.st-vl53l5cx", DeviceKind.TOF, _VERSION,
                           "STMicroelectronics", ("VL53L5CX",),
                           ("8x8", "distance-mm", "15hz")), RadxaTof)
@@ -25,5 +25,5 @@ register(DriverDescriptor("zelux.imu.multi-i2c", DeviceKind.IMU, _VERSION,
                           ("acceleration", "gyroscope", "orientation", "auto-detect")), RadxaIMU)
 
 __all__ = ["CameraDriver", "DeviceDriver", "DeviceKind", "DriverDescriptor", "FanDriver",
-           "ImuDriver", "ServoDriver", "TofDriver", "create", "descriptor", "descriptors",
+           "ImuDriver", "ServoDriver", "ServoCenterDriver", "TofDriver", "create", "descriptor", "descriptors",
            "RadxaCamera", "RadxaFan", "RadxaIMU", "RadxaServo", "RadxaTof"]
